@@ -5,12 +5,15 @@ import android.media.MediaFormat
 import com.example.testingthings.utils.logd
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.launch
+import java.io.BufferedOutputStream
 import java.io.BufferedWriter
+import java.net.Socket
 
 class MediaCodecCallback(
     private val scope: CoroutineScope,
-    private val bufferedWriter: BufferedWriter
+    private val bufferedWriter: BufferedOutputStream
 ) : MediaCodec.Callback() {
     private val bufferInfo by lazy { MediaCodec.BufferInfo() }
 
@@ -26,12 +29,18 @@ class MediaCodecCallback(
         if (index >= 0) {
             scope.launch(Dispatchers.IO) {
                 codec.getOutputBuffer(index)?.run {
-                    val bytes = ByteArray(bufferInfo.size).also(::get)
+                    val bytes = ByteArray(info.size)
+                    get(bytes)
+//                    get()
 
                     logd("Buffer size is: ${bytes.size}")
 
-                    bufferedWriter.write("Bytes: $bytes")
-                    bufferedWriter.newLine()
+//                    bufferedWriter.write("Bytes: $bytes")
+//                    bufferedWriter.newLine()
+//                    bufferedWriter.flush()
+
+
+                    bufferedWriter.write(bytes)
                     bufferedWriter.flush()
                 }
 

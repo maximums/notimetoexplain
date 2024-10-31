@@ -21,9 +21,15 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.io.BufferedOutputStream
 import java.io.BufferedWriter
 import java.net.ServerSocket
 import java.net.Socket
@@ -31,14 +37,11 @@ import java.net.Socket
 private const val CHANNEL_ID = "server_service_notification_channel"
 
 class ServerService() : Service() {
-    private var serverSocket: ServerSocket? = null
     private var mediaProjectionManager: MediaProjectionManager? = null
     private var mediaProjection: MediaProjection? = null
     private var encoder: MediaCodec? = null
     private var virtualDisplay: VirtualDisplay? = null
-    private val serverScope by lazy {
-        CoroutineScope(context = Job() + Dispatchers.IO + CoroutineName("ServerScope"))
-    }
+    private var serv: MediaSocketServer? = null
 
     override fun onCreate() {
         logd("onCreate")
@@ -60,7 +63,9 @@ class ServerService() : Service() {
         val data = intent?.getParcelableExtra("DATA", Intent::class.java)
 
         if (resultCode == RESULT_OK && data != null) {
-            serverSocket = startServer(resultCode, data)
+//            serverSocket = startServer(resultCode, data)
+            val flow = MutableSharedFlow<ByteArray>()
+            serv = MediaSocketServer(mediaFlow = flow).also { it.start() }
         }
 
         return START_NOT_STICKY
@@ -71,11 +76,6 @@ class ServerService() : Service() {
     override fun onDestroy() {
         logd("onDestroy")
 
-        serverSocket?.close()
-        serverSocket = null
-
-        serverScope.cancel()
-
         mediaProjection?.stop()
         mediaProjection = null
 
@@ -85,29 +85,16 @@ class ServerService() : Service() {
 
         virtualDisplay?.release()
         virtualDisplay = null
+
+        serv?.close()
+        serv = null
     }
 
-    private fun startServer(resultCode: Int, data: Intent) = ServerSocket(8099).also { server ->
-        try {
-            serverScope.launch {
-                while (isActive && !server.isClosed) {
-                    val socket = server.accept()
-
-                    logd("${socket.inetAddress}:${socket.port} is connected")
-
-                    encoder = createEncoder(socket.outputStream.bufferedWriter())
-                    startScreenRecording(resultCode, data)
-                }
-            }
-        } catch (e: Exception) {
-            loge(
-                message = "Got an exception bro, stack trace is:\n${e.printStackTrace()}",
-                exception = e
-            )
-        }
-    }
-
-    private fun createEncoder(stream: BufferedWriter, w: Int = 1280, h: Int = 720): MediaCodec {
+    private fun createEncoder(
+        stream: BufferedOutputStream,
+        w: Int = 1280,
+        h: Int = 720
+    ): MediaCodec {
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
             setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
@@ -119,7 +106,7 @@ class ServerService() : Service() {
         }
 
         return MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).also { codec ->
-            codec.setCallback(MediaCodecCallback(serverScope, stream))
+//            MediaSocketServer(mediaFlow = codec.myFlow())
             codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         }
     }
@@ -140,84 +127,48 @@ class ServerService() : Service() {
             null,
             null
         )
-
-//        processEncodedData()
-    }
-
-    private fun processEncodedData() {
-        val bufferInfo = MediaCodec.BufferInfo()
-
-        while (true) {
-            val outputBufferIndex = encoder!!.dequeueOutputBuffer(bufferInfo, 10000)
-            if (outputBufferIndex >= 0) {
-                val outputBuffer = encoder?.getOutputBuffer(outputBufferIndex)
-
-                // Write encoded data to file
-                outputBuffer?.let {
-                    val bytes = ByteArray(bufferInfo.size)
-                    it.get(bytes)
-                    logd("DATA IS: $bytes")
-//                    outputStream.write(bytes)
-                }
-
-                encoder?.releaseOutputBuffer(outputBufferIndex, false)
-            } else if (outputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                break
-            }
-        }
-
-        encoder?.stop()
-        encoder?.release()
     }
 }
 
-class ClientHandler(private val socket: Socket, private val encoder: MediaCodec) {
-    suspend operator fun invoke() {
-        socket.use { client ->
-            client.outputStream.bufferedWriter().use { writer ->
-                while (true) {
-                    writer.write("Hello ${client.inetAddress}:${client.port}!")
-                    writer.newLine()
-                    writer.flush()
-
-                    delay(1_000)
-                }
-            }
-//            client.inputStream.bufferedReader().use { reader ->
-//                client.outputStream.bufferedWriter().use { writer ->
-//                    val bufferInfo = MediaCodec.BufferInfo()
-//                    val outputBufferIndex = encoder.dequeueOutputBuffer(bufferInfo, 0)
-//                    if (outputBufferIndex >= 0) {
-//                        val encodedData = encoder.getOutputBuffer(outputBufferIndex)
-//                        if (encodedData != null) {
-//                            // Send encoded data through the output stream to the receiver device
-//                            val buffer = ByteArray(bufferInfo.size)
-//                            encodedData.get(buffer)
-//                            while (true) {
-//                                delay(1_000)
-//                                writer.write("buffer value: $buffer")
-//                                writer.newLine()
-//                                writer.flush()
-//                            }
-////                            writer.write(buffer, bufferInfo.offset, bufferInfo.size)
-////                            writer.flush()
-////                            writer.bufferedWriter()
-//
-//                            // Release the output buffer
-////                            encoder.releaseOutputBuffer(outputBufferIndex, false)
-//                        }
-//                    }
-////                    while (true) {
-////                        delay(1_000)
-////                        writer.run {
-////                            write("Hello ${client.inetAddress}:${client.port}!")
-////                            newLine()
-////                            write("${}")
-////                            flush()
-////                        }
-////                    }
-//                }
-//            }
+fun MediaCodec.myFlow() = callbackFlow<ByteArray> {
+    val callback = object : MediaCodec.Callback() {
+        override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
+            logd("onInputBufferAvailable, InputBufferIndex: $index")
         }
+
+        override fun onOutputBufferAvailable(
+            codec: MediaCodec,
+            index: Int,
+            info: MediaCodec.BufferInfo
+        ) {
+            logd("Available Output Buffer Index: $index")
+
+            if (index >= 0) {
+                codec.getOutputBuffer(index)?.run {
+                    val bytes = ByteArray(info.size).also(::get)
+
+                    logd("Buffer size: ${info.size}")
+
+                    trySend(bytes)
+                }
+
+                codec.releaseOutputBuffer(index, false)
+            }
+        }
+
+        override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
+            logd("onError, error: $e")
+            cancel("An error occurred in MediaCode, error: $e")
+        }
+
+        override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
+            logd("onOutputFormatChanged, format: $format")
+        }
+    }
+
+    setCallback(callback)
+
+    awaitClose {
+        setCallback(null)
     }
 }

@@ -13,26 +13,13 @@ import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.IBinder
-import com.example.testingthings.ui.theme.MediaCodecCallback
 import com.example.testingthings.utils.logd
-import com.example.testingthings.utils.loge
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.channels.awaitClose
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.flow.emitAll
-import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
-import java.io.BufferedOutputStream
-import java.io.BufferedWriter
-import java.net.ServerSocket
-import java.net.Socket
 
 private const val CHANNEL_ID = "server_service_notification_channel"
 
@@ -41,21 +28,27 @@ class ServerService() : Service() {
     private var mediaProjection: MediaProjection? = null
     private var encoder: MediaCodec? = null
     private var virtualDisplay: VirtualDisplay? = null
-    private var serv: MediaSocketServer? = null
+    private var socketServer: MediaSocketServer? = null
+    private val mediaDataFlow = MutableSharedFlow<ByteArray>(extraBufferCapacity = 1)
+    private val serviceScope =
+        CoroutineScope(SupervisorJob() + Dispatchers.IO + CoroutineName("Service Main Scope"))
 
     override fun onCreate() {
         logd("onCreate")
-        super.onCreate()
 
         NotificationChannel(CHANNEL_ID, "Server Service", NotificationManager.IMPORTANCE_LOW).also {
             it.description = "Server Service notification description for user. xD"
             getSystemService(NotificationManager::class.java).createNotificationChannel(it)
         }
+
         mediaProjectionManager = getSystemService(MediaProjectionManager::class.java)
+        encoder = createEncoder()
+        socketServer = MediaSocketServer(mediaFlow = mediaDataFlow, scope = serviceScope)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         logd("onStartCommand")
+
         val notification = Notification.Builder(this, CHANNEL_ID).build()
         startForeground(203, notification)
 
@@ -63,9 +56,8 @@ class ServerService() : Service() {
         val data = intent?.getParcelableExtra("DATA", Intent::class.java)
 
         if (resultCode == RESULT_OK && data != null) {
-//            serverSocket = startServer(resultCode, data)
-            val flow = MutableSharedFlow<ByteArray>()
-            serv = MediaSocketServer(mediaFlow = flow).also { it.start() }
+            socketServer?.start()
+            startScreenRecording(resultCode, data)
         }
 
         return START_NOT_STICKY
@@ -76,29 +68,28 @@ class ServerService() : Service() {
     override fun onDestroy() {
         logd("onDestroy")
 
+        socketServer?.close()
+        socketServer = null
+
         mediaProjection?.stop()
         mediaProjection = null
+
+        virtualDisplay?.release()
+        virtualDisplay = null
 
         encoder?.stop()
         encoder?.release()
         encoder = null
 
-        virtualDisplay?.release()
-        virtualDisplay = null
-
-        serv?.close()
-        serv = null
+        serviceScope.cancel()
     }
 
-    private fun createEncoder(
-        stream: BufferedOutputStream,
-        w: Int = 1280,
-        h: Int = 720
-    ): MediaCodec {
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
+    private fun createEncoder(width: Int = 1280, height: Int = 720): MediaCodec {
+        val format = MediaFormat.createVideoFormat(
+            MediaFormat.MIMETYPE_VIDEO_AVC, width, height
+        ).apply {
             setInteger(
-                MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+                MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
             )
             setInteger(MediaFormat.KEY_BIT_RATE, 6000000) // Set bitrate
             setInteger(MediaFormat.KEY_FRAME_RATE, 30) // Set frame rate
@@ -106,7 +97,7 @@ class ServerService() : Service() {
         }
 
         return MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).also { codec ->
-//            MediaSocketServer(mediaFlow = codec.myFlow())
+            codec.setCallback(MediaCodecCallback(mediaFlow = mediaDataFlow, scope = serviceScope))
             codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         }
     }
@@ -127,48 +118,5 @@ class ServerService() : Service() {
             null,
             null
         )
-    }
-}
-
-fun MediaCodec.myFlow() = callbackFlow<ByteArray> {
-    val callback = object : MediaCodec.Callback() {
-        override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
-            logd("onInputBufferAvailable, InputBufferIndex: $index")
-        }
-
-        override fun onOutputBufferAvailable(
-            codec: MediaCodec,
-            index: Int,
-            info: MediaCodec.BufferInfo
-        ) {
-            logd("Available Output Buffer Index: $index")
-
-            if (index >= 0) {
-                codec.getOutputBuffer(index)?.run {
-                    val bytes = ByteArray(info.size).also(::get)
-
-                    logd("Buffer size: ${info.size}")
-
-                    trySend(bytes)
-                }
-
-                codec.releaseOutputBuffer(index, false)
-            }
-        }
-
-        override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
-            logd("onError, error: $e")
-            cancel("An error occurred in MediaCode, error: $e")
-        }
-
-        override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
-            logd("onOutputFormatChanged, format: $format")
-        }
-    }
-
-    setCallback(callback)
-
-    awaitClose {
-        setCallback(null)
     }
 }
